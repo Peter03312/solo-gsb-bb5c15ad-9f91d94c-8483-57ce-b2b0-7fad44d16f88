@@ -22,10 +22,12 @@ from .imaging import (
     UnsupportedFormatError,
     load_oriented,
     render_publication,
+    scale_rect,
 )
 from .models import (
     AnnotationsPut,
     BatchPublishRequest,
+    MigrationRequest,
     PackageRequest,
     PublishRequest,
     WithdrawRequest,
@@ -487,6 +489,164 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "doc_id": doc_id,
             "revision": new_revision,
             "rects": [r.model_dump() for r in body.rects],
+        }
+
+    # ---------------- 遮盖方案迁移（同版式、不同尺寸，整批原子） ----------------
+
+    @app.post("/annotation-migrations")
+    def migrate_annotations(body: MigrationRequest) -> dict:
+        """把源文档当前非空标注按旋正后宽高分别缩放，整体替换到多份目标文档。
+
+        全部校验（数量、目标去重、源不作为目标、源/目标存在性、源与各目标
+        修订号匹配、源当前标注非空）与对各目标的"读-缩放-替换-修订号 +1"
+        都在同一个 ``BEGIN IMMEDIATE`` 写事务内完成，因此与并发的标注修改、
+        发布（单份/批次）、撤回/打包等持写锁的操作互斥串行：任一校验失败，
+        所有目标标注保持原样、修订号不变；全部通过时各目标同时进入新修订。
+        源标注只被读取，源与任何既有发布版均不改动；各目标的历史标注修订
+        仍按 (doc_id, revision) 追加保留，新矩形以新修订号写入。
+        """
+        targets = body.targets
+
+        # 结构性校验不依赖库内状态，失败无需进入事务。
+        if not 1 <= len(targets) <= 20:
+            _error(
+                400,
+                "invalid_migration_size",
+                f"migration must target between 1 and 20 documents,"
+                f" got {len(targets)}",
+                count=len(targets),
+            )
+        seen: set[str] = set()
+        for pos, item in enumerate(targets):
+            if item.doc_id in seen:
+                _error(
+                    400,
+                    "duplicate_target_in_migration",
+                    f"target document '{item.doc_id}' appears more than once"
+                    " in the migration request",
+                    position=pos,
+                    doc_id=item.doc_id,
+                )
+            seen.add(item.doc_id)
+        if body.source_doc_id in seen:
+            _error(
+                400,
+                "source_among_targets",
+                "the source document cannot also be a migration target",
+                doc_id=body.source_doc_id,
+            )
+
+        result_targets: list[dict] = []
+        with write_tx(settings.db_path) as conn:
+            # 源存在性与修订号（乐观锁），随后读取其当前非空标注。
+            source = conn.execute(
+                "SELECT * FROM documents WHERE id = ?", (body.source_doc_id,)
+            ).fetchone()
+            if source is None:
+                _error(
+                    404,
+                    "document_not_found",
+                    f"source document '{body.source_doc_id}' does not exist",
+                    doc_id=body.source_doc_id,
+                )
+            if body.source_revision != source["annotation_revision"]:
+                _error(
+                    409,
+                    "stale_revision",
+                    f"source annotation revision mismatch: expected"
+                    f" {source['annotation_revision']}, got"
+                    f" {body.source_revision}; re-fetch and retry",
+                    doc_id=source["id"],
+                    current_revision=source["annotation_revision"],
+                    supplied_revision=body.source_revision,
+                )
+            src_rects = conn.execute(
+                "SELECT x, y, w, h, reason FROM annotation_rects"
+                " WHERE doc_id = ? AND revision = ? ORDER BY idx",
+                (source["id"], source["annotation_revision"]),
+            ).fetchall()
+            if not src_rects:
+                _error(
+                    400,
+                    "source_annotations_empty",
+                    "the source document's current annotations contain no"
+                    " rectangles; nothing to migrate",
+                    doc_id=source["id"],
+                    source_revision=source["annotation_revision"],
+                )
+
+            # 第一阶段：按请求顺序逐项目标校验（存在性 + 预期修订号），
+            # 先定位失败项，再写入任何标注。
+            prepared: list[tuple[Any, int, list[dict]]] = []
+            for pos, item in enumerate(targets):
+                doc = conn.execute(
+                    "SELECT * FROM documents WHERE id = ?", (item.doc_id,)
+                ).fetchone()
+                if doc is None:
+                    _error(
+                        404,
+                        "document_not_found",
+                        f"document '{item.doc_id}' does not exist",
+                        position=pos,
+                        doc_id=item.doc_id,
+                    )
+                current = doc["annotation_revision"]
+                if item.expected_revision != current:
+                    _error(
+                        409,
+                        "stale_revision",
+                        f"annotation revision mismatch for '{item.doc_id}':"
+                        f" expected {current}, got {item.expected_revision};"
+                        " re-fetch and retry",
+                        position=pos,
+                        doc_id=item.doc_id,
+                        current_revision=current,
+                        supplied_revision=item.expected_revision,
+                    )
+                # 宽、高方向分别按旋正后尺寸缩放：左上向下取整、
+                # 右下向上取整并夹到目标图内，原因与顺序不变。
+                mapped = [
+                    scale_rect(
+                        r,
+                        source["width"], source["height"],
+                        doc["width"], doc["height"],
+                    )
+                    for r in src_rects
+                ]
+                prepared.append((doc, current, mapped))
+
+            # 第二阶段：全部校验通过，逐目标以新修订号追加矩形，
+            # 再把当前修订号 +1（旧修订矩形永不改写）。
+            for pos, (doc, current, mapped) in enumerate(prepared):
+                new_revision = current + 1
+                for idx, r in enumerate(mapped):
+                    conn.execute(
+                        "INSERT INTO annotation_rects"
+                        " (doc_id, revision, idx, x, y, w, h, reason)"
+                        " VALUES (?,?,?,?,?,?,?,?)",
+                        (
+                            doc["id"], new_revision, idx,
+                            r["x"], r["y"], r["w"], r["h"], r["reason"],
+                        ),
+                    )
+                conn.execute(
+                    "UPDATE documents SET annotation_revision = ? WHERE id = ?",
+                    (new_revision, doc["id"]),
+                )
+                result_targets.append(
+                    {
+                        "position": pos,
+                        "doc_id": doc["id"],
+                        "revision": new_revision,  # 迁移后的当前修订号
+                        "rects": mapped,           # 顺序与源标注一致
+                    }
+                )
+
+        return {
+            "source_doc_id": source["id"],
+            "source_revision": source["annotation_revision"],
+            "count": len(result_targets),
+            "targets": result_targets,  # 顺序与请求一致
         }
 
     # ---------------- 发布 ----------------

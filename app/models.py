@@ -26,6 +26,20 @@ class BatchItem(BaseModel):
     expected_revision: int = Field(ge=0)
 
 
+class MigrationRequest(BaseModel):
+    """遮盖方案迁移请求：把源文档当前标注整批缩放到多个目标文档。
+
+    携带源文档 ID、源当前标注修订号，以及 1～20 个不同目标文档 ID 与
+    各自预期修订号（源不能作为目标）。数量、重复、源是否混入目标等
+    语义校验在路由内完成，以返回统一格式的业务错误码。
+    """
+
+    source_doc_id: str = Field(min_length=1, max_length=64)
+    source_revision: int = Field(ge=0)
+    targets: list[BatchItem] = Field(default_factory=list)
+
+
+
 class PublishRequest(BaseModel):
     """单份发布请求（整体可选）：可指定统一的 UTC 公开时间。
 

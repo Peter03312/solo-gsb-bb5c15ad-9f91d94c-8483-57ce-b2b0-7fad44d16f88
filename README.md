@@ -62,6 +62,7 @@ python -m pytest tests/ -q
 | GET  | `/documents/{doc_id}` | 文档元数据与发布列表 |
 | GET  | `/documents/{doc_id}/annotations` | 当前标注修订号与矩形 |
 | PUT  | `/documents/{doc_id}/annotations` | 整体替换标注，须携带当前修订号 |
+| POST | `/annotation-migrations` | **遮盖方案迁移**：源当前非空标注按旋正后宽高分别缩放，整体替换 1～20 份同版式不同尺寸目标（原子：全成功或全部不变） |
 | POST | `/documents/{doc_id}/publish` | 按当前标注发布新版本（涂实+去元数据 PNG）；可选 JSON 体 `{"publish_at": "..."}` 指定 UTC 公开时间，省略立即公开 |
 | GET  | `/documents/{doc_id}/publications` | 发布版本列表（含公开时间、撤回状态） |
 | POST | `/documents/{doc_id}/publications/{version}/withdraw` | 凭非空原因**永久撤回**该版本（重复撤回返回首次记录） |
@@ -118,9 +119,91 @@ curl -s $BASE/documents/$DOC_ID/publications   # v1 条目 withdrawn=true
 
 完整可运行脚本：`examples/demo.sh`（单份流程）、`examples/demo_batch.sh`
 （批次发布流程）、`examples/demo_idempotency.sh`（批次幂等键流程）、
-`examples/demo_scheduled_publication.sh`（定时公开流程）与
-`examples/demo_withdrawal.sh`（版本撤回流程）；
+`examples/demo_scheduled_publication.sh`（定时公开流程）、
+`examples/demo_withdrawal.sh`（版本撤回流程）与
+`examples/demo_migration.sh`（遮盖方案迁移流程）；
 先启动服务，再执行 `bash examples/demo_scheduled_publication.sh`。
+
+## 遮盖方案迁移（同版式、不同尺寸，整批原子）
+
+档案员要把一份**已标注**影像的遮盖方案套用到**同版式、不同尺寸**的多份影像时，
+调用 `POST /annotation-migrations`。请求体携带**源文档 ID、源当前标注修订号**，
+以及按顺序列出的 **1～20 个不同目标文档 ID 与各自预期修订号**（源不能作为
+目标）：
+
+- **只用源当前非空标注**：读取源在 `source_revision`（必须等于其当前修订号）
+  下的矩形；当前一个矩形都没有（从未标注或已清空）时返回
+  `400 source_annotations_empty`，不迁移任何内容。
+- **按宽、高分别缩放**：以各文档 **EXIF 旋正后的宽/高** 为基准，宽方向与
+  高方向独立缩放；**左上边界向下取整、右下边界向上取整**（宁可多遮、绝不
+  漏遮），再把结果**限制在目标图内**；矩形的**原因原样保留、顺序与源一致**。
+  全部为整数运算，源矩形合法（w/h > 0）时迁移结果必然 w/h ≥ 1 且不越界。
+- **整体替换 + 修订号 +1**：仅当源与**所有目标**都存在、且源修订号与各目标
+  预期修订号**全部匹配**时，才在**同一个 `BEGIN IMMEDIATE` 事务**内把缩放后
+  的矩形作为各目标的**新当前标注**整体写入（旧修订矩形按
+  `(doc_id, revision)` 追加保留、永不改写），各目标修订号各加一。
+- **任一校验失败则全部不变**：数量越界、目标重复、源混入目标、源/目标
+  不存在、源或任一目标修订号不匹配、源标注为空——失败响应按统一错误体返回，
+  目标侧问题附 `position`（从 0 起）/`doc_id`，修订过期另附
+  `current_revision`/`supplied_revision`；**所有目标标注与修订号保持原样**，
+  不产生部分迁移，可用修正后的参数重试。
+- **源与既有发布版不变**：源标注只被读取（修订号、矩形均不改）；目标的历史
+  发布版绑定的是各自旧修订矩形，迁移不影响任何已发布成品。迁移事务与并发的
+  标注修改、单份/批次发布（及撤回、打包等持写锁的操作）**互斥串行**。
+
+```bash
+BASE=http://localhost:8000
+curl -sS -X POST "$BASE/annotation-migrations" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "source_doc_id": "SRC_DOC_ID",
+    "source_revision": 1,
+    "targets": [
+      {"doc_id": "BIG_DOC_ID",   "expected_revision": 0},
+      {"doc_id": "SMALL_DOC_ID", "expected_revision": 0}
+    ]
+  }'
+```
+
+成功 `200`：返回源文档 ID、所用源修订号，以及按**请求顺序**排列的各目标
+新修订号与映射矩形（坐标基于各目标旋正后的图像）：
+
+```json
+{
+  "source_doc_id": "…",
+  "source_revision": 1,
+  "count": 2,
+  "targets": [
+    {"position": 0, "doc_id": "BIG_DOC_ID", "revision": 1,
+     "rects": [
+       {"x": 0, "y": 0, "w": 200, "h": 100, "reason": "整页边框"},
+       {"x": 66, "y": 14, "w": 6, "h": 6, "reason": "印章"}
+     ]},
+    {"position": 1, "doc_id": "SMALL_DOC_ID", "revision": 1,
+     "rects": [
+       {"x": 0, "y": 0, "w": 50, "h": 25, "reason": "整页边框"},
+       {"x": 16, "y": 3, "w": 2, "h": 2, "reason": "印章"}
+     ]}
+  ]
+}
+```
+
+上例源图 100x50、源矩形 `(33,7,3,3)`：放大到 200x100 得 `(66,14,6,6)`；
+缩小到 50x25 时 x 方向左边界 `floor(33·50/100)=16`、右边界
+`ceil(36·50/100)=18`（即 w=2），y 方向上边界 `floor(7·25/50)=3`、
+下边界 `ceil(10·25/50)=5`（即 h=2）。迁移后可用
+`GET /documents/{doc_id}/annotations` 核对，或直接
+`POST /documents/{doc_id}/publish` 按迁移结果发布。
+
+错误码：`invalid_migration_size`（400，目标数不在 1～20，附 `count`）、
+`duplicate_target_in_migration`（400，附 `position`/`doc_id`）、
+`source_among_targets`（400）、`source_annotations_empty`（400）、
+`document_not_found`（404；源侧附 `doc_id`，目标侧附 `position`/`doc_id`）、
+`stale_revision`（409；源侧附 `doc_id`/`current_revision`/
+`supplied_revision`，目标侧另附 `position`）。
+
+端到端示例：`bash examples/demo_migration.sh`。
+
 
 ## 定时公开（统一 UTC 公开时间 `publish_at`）
 
@@ -431,6 +514,10 @@ manifest.json
 | 400 | `empty_rectangle` | 矩形宽或高 ≤ 0 |
 | 400 | `rectangle_out_of_bounds` | 矩形越出旋正后图像边界 |
 | 400 | `reason_required` | 矩形未填写原因；撤回原因为空白 |
+| 400 | `invalid_migration_size` | 迁移目标数不在 1～20（附 `count`） |
+| 400 | `duplicate_target_in_migration` | 迁移请求中目标文档 ID 重复（附 `position`/`doc_id`） |
+| 400 | `source_among_targets` | 迁移源文档同时出现在目标列表中 |
+| 400 | `source_annotations_empty` | 迁移源当前标注不含任何矩形（从未标注或已清空） |
 | 400 | `invalid_publish_time` | `publish_at` 无法解析、不带时区偏移、不晚于当前时刻或晚于当前超过 30 天 |
 | 404 | `document_not_found` | 文档不存在（批次场景附 `position`/`doc_id`） |
 | 404 | `unknown_version` | 发布版本不存在 |
@@ -439,7 +526,7 @@ manifest.json
 | 410 | `publication_withdrawn` | 公开读取已撤回的版本（不返回成品与遮盖详情） |
 | 400 | `invalid_batch_size` | 批次文档数不在 2～20（附 `count`） |
 | 400 | `duplicate_document_in_batch` | 批次内文档 ID 重复（附 `position`/`doc_id`） |
-| 409 | `stale_revision` | 标注修订号过期（响应附 `current_revision`；批次场景另附 `position`/`doc_id`/`supplied_revision`） |
+| 409 | `stale_revision` | 标注修订号过期（响应附 `current_revision`；批次/迁移场景另附 `position`/`doc_id`/`supplied_revision`，迁移源侧附 `doc_id`） |
 | 409 | `idempotency_key_conflict` | 幂等键已用于不同内容的批次请求（原批次不受影响） |
 | 500 | `original_unavailable` | 存储的原图无法读取/解码（批次场景附 `position`/`doc_id`） |
 | 500 | `artifact_write_failed` | 发布成品写入磁盘失败（附 `position`/`doc_id`/`version`） |
@@ -457,6 +544,13 @@ manifest.json
   的像素坐标上进行，与查看器所见方向一致。
 - **乐观锁**：`PUT /documents/{id}/annotations` 要求 `revision` 等于服务端当前修订号，
   在 `BEGIN IMMEDIATE` 事务内 check-and-set，过期即 409，不会丢失他人修改。
+- **方案迁移**：`POST /annotation-migrations` 在**一个** `BEGIN IMMEDIATE` 事务内
+  完成源修订号校验、源当前非空矩形读取，以及按请求顺序对各目标的存在性/预期修订号
+  校验、按旋正后宽高分别整数缩放（左上 `floor`、右下 `ceil` 并夹到目标图内）、
+  新修订矩形追加与修订号 +1；全部校验通过才写入，任一失败整体回滚，所有目标标注与
+  修订号不变。迁移与标注修改、单份/批次发布（及撤回、打包）持同一写锁互斥串行；
+  源标注只读不改，各目标历史修订矩形与已发布成品均不受影响。
+
 - **发布事务**：读取当前修订号与矩形、渲染涂实、写盘、插入发布记录在同一写事务中完成；
   与标注修改互斥串行，因此成品文件与记录必然对应同一修订。
 - **批次原子性**：`POST /publication-batches` 在**一个** `BEGIN IMMEDIATE` 事务内
@@ -511,8 +605,8 @@ manifest.json
 app/
   main.py     # FastAPI 路由与事务编排
   db.py       # SQLite 模式与事务助手（WAL + BEGIN IMMEDIATE）
-  imaging.py  # 解码、EXIF 旋正、涂实、去元数据渲染
-  models.py   # 请求体模型（含批次请求）
+  imaging.py  # 解码、EXIF 旋正、涂实、去元数据渲染、矩形缩放
+  models.py   # 请求体模型（含批次、迁移请求）
   config.py   # 环境变量配置
 tests/test_api.py    # 16 个用例：含 EXIF、乐观锁、错误码、不可变性、并发一致性
 tests/test_batch.py  # 12 个用例：批次成功/顺序、数量与重复、文档缺失/修订过期/
@@ -528,16 +622,43 @@ tests/test_package.py        # 13 个用例：交付包顺序/清单/摘要/遮�
                              #   不取上传名、同文档多版本、数量与重复、
                              #   未知/未到点/撤回整包拒绝不泄露、成品缺失损坏
                              #   不交付部分包、资格确认与撤回串行、临时文件清理
+tests/test_migration.py      # 20 个用例：缩放取整（floor/ceil/独立宽高）、成功
+                             #   迁移与修订号 +1、原因与顺序、源与历史/发布版
+                             #   不变、数量/重复/源混入目标/缺失/修订过期/源为空
+                             #   整批原子失败不推进修订号、迁移与标注发布并发串行
 examples/demo.sh             # 单份端到端 curl 示例
 examples/demo_batch.sh       # 批次发布端到端 curl 示例
 examples/demo_idempotency.sh # 批次幂等键端到端 curl 示例
 examples/demo_scheduled_publication.sh  # 定时公开端到端 curl 示例
 examples/demo_withdrawal.sh  # 版本撤回端到端 curl 示例
 examples/demo_package.sh     # 离线交付包端到端 curl 示例
+examples/demo_migration.sh   # 遮盖方案迁移端到端 curl 示例
 Dockerfile / docker-compose.yml
 ```
 
-## 本轮变动（离线交付包 ZIP）
+## 本轮变动（遮盖方案迁移）
+
+- 新增 `POST /annotation-migrations`：请求体
+  `{"source_doc_id","source_revision","targets":[{"doc_id","expected_revision"},…]}`
+  携带源文档 ID、源当前标注修订号与 **1～20 个不同目标**（源不能作为目标）；
+  仅使用源**当前非空**标注（为空报 `source_annotations_empty`），按各文档
+  **旋正后宽、高分别缩放**——左上边界向下取整、右下边界向上取整并限制在
+  目标图内，**保留原因与原顺序**；成功 `200` 按请求顺序返回各目标新修订号
+  （各 +1）与映射矩形。
+- 源及所有目标都存在、源修订号与各目标预期修订号全部匹配时，才在**同一个
+  `BEGIN IMMEDIATE` 事务**内整体替换各目标标注；任一校验失败则所有目标不变
+  （附 `position`/`doc_id` 等定位），可修正后重试。事务与标注修改、发布
+  （单份/批次）、撤回、打包串行；**源标注及既有发布版不变**，目标历史修订
+  矩形照旧追加保留。
+- 新增错误码：`invalid_migration_size`、`duplicate_target_in_migration`、
+  `source_among_targets`、`source_annotations_empty`；既有
+  `document_not_found`/`stale_revision` 在迁移场景附定位字段。
+- 纯缩放逻辑位于 `app/imaging.py::scale_rect`（全整数运算）；**不新增任何
+  数据表或列**，上传、标注、发布（含定时公开）、批次与幂等键、撤回、公开读取、
+  离线交付包的路由、请求/响应字段及启动方式（Docker Compose / uvicorn）全部
+  保持兼容。
+
+## 历史变动（离线交付包 ZIP）
 
 - 新增 `POST /publication-packages`：请求体 `{"items":[{"doc_id","version"},…]}`
   按顺序携带 **2～20 个互不重复的 `(doc_id, version)` 对**；成功 `200` 返回

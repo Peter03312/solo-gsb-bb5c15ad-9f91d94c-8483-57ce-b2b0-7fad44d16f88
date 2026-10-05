@@ -6,7 +6,42 @@ from typing import Any, Iterable, Mapping
 
 from PIL import Image, ImageDraw, ImageOps
 
+
+
 SUPPORTED_FORMATS = {"PNG": ".png", "JPEG": ".jpg"}
+
+
+def scale_rect(
+    rect: Mapping[str, Any],
+    src_width: int,
+    src_height: int,
+    dst_width: int,
+    dst_height: int,
+) -> dict:
+    """把源图（旋正后）坐标系中的一个矩形缩放到目标图坐标系。
+
+    宽、高方向分别缩放（适配同版式、不同尺寸），全部使用整数运算：
+    左上边界向下取整（``floor``），右下边界向上取整（``ceil``），
+    使遮盖区域向外扩一点也不缩——宁可多遮，不可漏遮。结果再夹到
+    目标图 ``[0, dst_width/dst_height]`` 内。``reason`` 原样保留。
+
+    源矩形为标注接口接受的合法矩形（w,h > 0 且在源图内），因此
+    floor 左/上边界严格小于 ceil 右/下边界，输出 w/h 必然 >= 1。
+    """
+    src_right = rect["x"] + rect["w"]
+    src_bottom = rect["y"] + rect["h"]
+    # floor(a*num/den)：非负整数下整除即向下取整
+    nx = rect["x"] * dst_width // src_width
+    ny = rect["y"] * dst_height // src_height
+    # ceil(a*num/den) = (a*num + den - 1) // den
+    nr = (src_right * dst_width + src_width - 1) // src_width
+    nb = (src_bottom * dst_height + src_height - 1) // src_height
+    # 限制在目标图内
+    nx = max(0, min(nx, dst_width))
+    ny = max(0, min(ny, dst_height))
+    nr = max(0, min(nr, dst_width))
+    nb = max(0, min(nb, dst_height))
+    return {"x": nx, "y": ny, "w": nr - nx, "h": nb - ny, "reason": rect["reason"]}
 
 
 class ImageDecodeError(Exception):
