@@ -51,6 +51,24 @@ class BatchPublishRequest(BaseModel):
     publish_at: str | None = Field(default=None, max_length=64)
 
 
+class MigrationItem(BaseModel):
+    """标注迁移中的源/目标文档：文档 ID 与调用方预期的当前标注修订号。"""
+
+    doc_id: str = Field(min_length=1, max_length=64)
+    expected_revision: int = Field(ge=0)
+
+
+class AnnotationMigrationRequest(BaseModel):
+    """标注迁移请求：把源文档当前非空标注按比例迁移到 1～20 个不同目标。
+
+    源不能同时作为目标；数量、重复等语义校验在路由内完成，
+    以返回统一格式的业务错误码。
+    """
+
+    source: MigrationItem
+    targets: list[MigrationItem] = Field(default_factory=list)
+
+
 class WithdrawRequest(BaseModel):
     """撤回已发布版本：原因必填（去空白后为空则在路由内拒绝）。
 

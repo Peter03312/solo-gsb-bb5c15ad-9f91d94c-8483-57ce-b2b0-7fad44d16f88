@@ -24,6 +24,7 @@ from .imaging import (
     render_publication,
 )
 from .models import (
+    AnnotationMigrationRequest,
     AnnotationsPut,
     BatchPublishRequest,
     PackageRequest,
@@ -169,6 +170,33 @@ def _rect_out(row: Any) -> dict:
         "h": row["h"],
         "reason": row["reason"],
     }
+
+
+def _map_rects(
+    rects: Any, src_w: int, src_h: int, dst_w: int, dst_h: int
+) -> list[dict]:
+    """把源文档旋正后坐标系中的矩形按比例映射到目标文档坐标系。
+
+    宽、高方向分别按 目标/源 比例缩放：左上边界向下取整、右下边界向上
+    取整，并限制在目标图内；原因与原顺序保留。源矩形非空（w,h ≥ 1）时
+    映射结果同样非空——右边界严格大于左边界（ceil(b) > floor(a)，b>a），
+    故 w',h' ≥ 1；源矩形在源图内时结果本就在目标图内，钳制只是保险。
+    """
+    mapped: list[dict] = []
+    for r in rects:
+        x1 = r["x"] * dst_w // src_w
+        y1 = r["y"] * dst_h // src_h
+        x2 = ((r["x"] + r["w"]) * dst_w + src_w - 1) // src_w  # ceil
+        y2 = ((r["y"] + r["h"]) * dst_h + src_h - 1) // src_h
+        x1 = min(max(x1, 0), dst_w)
+        y1 = min(max(y1, 0), dst_h)
+        x2 = min(max(x2, 0), dst_w)
+        y2 = min(max(y2, 0), dst_h)
+        mapped.append(
+            {"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1,
+             "reason": r["reason"]}
+        )
+    return mapped
 
 
 def _pub_entry(row: Any, keys: list[str]) -> dict:
@@ -487,6 +515,164 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "doc_id": doc_id,
             "revision": new_revision,
             "rects": [r.model_dump() for r in body.rects],
+        }
+
+    # ---------------- 标注迁移（同版式多目标，整批原子） ----------------
+
+    @app.post("/annotation-migrations", status_code=201)
+    def migrate_annotations(body: AnnotationMigrationRequest) -> dict:
+        """把源文档当前非空标注按旋正后宽高比例迁移到 1～20 个目标文档。
+
+        源与全部目标都存在且预期修订号匹配时，才在同一个
+        ``BEGIN IMMEDIATE`` 写事务内整体替换各目标标注（目标修订号各加一，
+        矩形按各自旋正后宽高分别缩放，原因与原顺序保留）；任一校验失败
+        全部目标不变，错误体附 ``position``/``doc_id`` 标明失败项。
+        与标注修改、单份/批次发布互斥串行；源标注与既有发布版不受影响。
+        """
+        source = body.source
+        targets = body.targets
+
+        # 结构性校验（不依赖库状态，先于事务）：数量、目标重复、源不得作为目标
+        if not 1 <= len(targets) <= 20:
+            _error(
+                400,
+                "invalid_migration_size",
+                f"migration must contain between 1 and 20 targets,"
+                f" got {len(targets)}",
+                count=len(targets),
+            )
+        seen: set[str] = set()
+        for pos, t in enumerate(targets):
+            if t.doc_id in seen:
+                _error(
+                    400,
+                    "duplicate_document_in_migration",
+                    f"document '{t.doc_id}' appears more than once as a target",
+                    position=pos,
+                    doc_id=t.doc_id,
+                )
+            seen.add(t.doc_id)
+            if t.doc_id == source.doc_id:
+                _error(
+                    400,
+                    "source_is_target",
+                    f"source document '{source.doc_id}' cannot also be a target",
+                    position=pos,
+                    doc_id=t.doc_id,
+                )
+
+        with write_tx(settings.db_path) as conn:
+            # 第一阶段：源校验（存在 -> 修订号匹配 -> 当前标注非空）
+            src = conn.execute(
+                "SELECT * FROM documents WHERE id = ?", (source.doc_id,)
+            ).fetchone()
+            if src is None:
+                _error(
+                    404,
+                    "document_not_found",
+                    f"source document '{source.doc_id}' does not exist",
+                    doc_id=source.doc_id,
+                )
+            src_revision = src["annotation_revision"]
+            if source.expected_revision != src_revision:
+                _error(
+                    409,
+                    "stale_revision",
+                    f"annotation revision mismatch for source"
+                    f" '{source.doc_id}': expected {src_revision},"
+                    f" got {source.expected_revision}; re-fetch and retry",
+                    doc_id=source.doc_id,
+                    current_revision=src_revision,
+                    supplied_revision=source.expected_revision,
+                )
+            src_rects = conn.execute(
+                "SELECT x, y, w, h, reason FROM annotation_rects"
+                " WHERE doc_id = ? AND revision = ? ORDER BY idx",
+                (src["id"], src_revision),
+            ).fetchall()
+            if not src_rects:
+                _error(
+                    400,
+                    "empty_source_annotations",
+                    f"source document '{source.doc_id}' has no annotation"
+                    f" rectangles at current revision {src_revision};"
+                    " nothing to migrate",
+                    doc_id=source.doc_id,
+                )
+
+            # 第二阶段：按请求顺序逐目标校验（存在 + 修订号匹配），
+            # 全部通过前不改写任何目标。
+            prepared: list[tuple[int, Any, int]] = []
+            for pos, t in enumerate(targets):
+                doc = conn.execute(
+                    "SELECT * FROM documents WHERE id = ?", (t.doc_id,)
+                ).fetchone()
+                if doc is None:
+                    _error(
+                        404,
+                        "document_not_found",
+                        f"document '{t.doc_id}' does not exist",
+                        position=pos,
+                        doc_id=t.doc_id,
+                    )
+                revision = doc["annotation_revision"]
+                if t.expected_revision != revision:
+                    _error(
+                        409,
+                        "stale_revision",
+                        f"annotation revision mismatch for '{t.doc_id}':"
+                        f" expected {revision}, got {t.expected_revision};"
+                        " re-fetch and retry",
+                        position=pos,
+                        doc_id=t.doc_id,
+                        current_revision=revision,
+                        supplied_revision=t.expected_revision,
+                    )
+                prepared.append((pos, doc, revision))
+
+            # 第三阶段：整体替换各目标标注（新修订号 = 当前 + 1），
+            # 矩形按各目标旋正后宽高分别缩放，原因与原顺序保留。
+            result_targets: list[dict] = []
+            for pos, doc, revision in prepared:
+                mapped = _map_rects(
+                    src_rects, src["width"], src["height"],
+                    doc["width"], doc["height"],
+                )
+                new_revision = revision + 1
+                for idx, m in enumerate(mapped):
+                    conn.execute(
+                        "INSERT INTO annotation_rects"
+                        " (doc_id, revision, idx, x, y, w, h, reason)"
+                        " VALUES (?,?,?,?,?,?,?,?)",
+                        (
+                            doc["id"],
+                            new_revision,
+                            idx,
+                            m["x"],
+                            m["y"],
+                            m["w"],
+                            m["h"],
+                            m["reason"],
+                        ),
+                    )
+                conn.execute(
+                    "UPDATE documents SET annotation_revision = ? WHERE id = ?",
+                    (new_revision, doc["id"]),
+                )
+                result_targets.append(
+                    {
+                        "position": pos,
+                        "doc_id": doc["id"],
+                        "revision": new_revision,
+                        "rects": mapped,
+                    }
+                )
+
+        return {
+            "source_doc_id": src["id"],
+            "source_revision": src_revision,
+            "count": len(result_targets),
+            "targets": result_targets,  # 顺序与请求一致
         }
 
     # ---------------- 发布 ----------------

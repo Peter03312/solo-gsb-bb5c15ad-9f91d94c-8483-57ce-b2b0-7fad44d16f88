@@ -18,6 +18,14 @@
 版本只要出现一项即**整包拒绝**且不泄露该项成品/遮盖详情；重复项、数量越界同样明确
 报错。打包的资格确认与撤回**串行**：撤回先生效则拒绝，打包先确认则本次交付完成。
 
+同版式、不同尺寸的系列影像还可以做**标注迁移**：凭源文档 ID、源当前标注修订号与
+**1～20 个不同目标文档**（各带预期修订号，源不能作为目标），把源当前**非空**标注按
+旋正后宽高比例分别缩放到各目标——左上边界向下取整、右下边界向上取整并限制在目标
+图内，原因与原顺序保留。源及全部目标都存在且修订号匹配时，才在同一事务中**整体
+替换**各目标标注（目标修订号各加一），并按请求顺序返回新修订号与映射矩形；任一
+校验失败则所有目标不变并标明失败项。迁移与标注修改、发布串行；源标注及既有发布
+版不变。
+
 ## 一键启动（Docker Compose）
 
 ```bash
@@ -71,6 +79,7 @@ python -m pytest tests/ -q
 | GET  | `/publications/{doc_id}/{version}` | 公开读取：版本元数据+遮盖坐标与原因（未到公开时间 404） |
 | GET  | `/publications/{doc_id}/{version}/image` | 公开读取：发布版 PNG（未到公开时间 404） |
 | POST | `/publication-packages` | **离线交付包**：按请求顺序提交 2～20 个互不重复的 `(doc_id, version)`，成功返回 ZIP（各版 PNG + `manifest.json` 清单）；任一项未知/未到公开时间/已撤回即整包拒绝 |
+| POST | `/annotation-migrations` | **标注迁移**：把源文档当前非空标注按旋正后宽高比例迁移到 1～20 个不同目标（整批原子：全部目标整体替换、修订号各加一，或全部不变） |
 
 ## 调用示例（curl）
 
@@ -118,9 +127,10 @@ curl -s $BASE/documents/$DOC_ID/publications   # v1 条目 withdrawn=true
 
 完整可运行脚本：`examples/demo.sh`（单份流程）、`examples/demo_batch.sh`
 （批次发布流程）、`examples/demo_idempotency.sh`（批次幂等键流程）、
-`examples/demo_scheduled_publication.sh`（定时公开流程）与
-`examples/demo_withdrawal.sh`（版本撤回流程）；
-先启动服务，再执行 `bash examples/demo_scheduled_publication.sh`。
+`examples/demo_scheduled_publication.sh`（定时公开流程）、
+`examples/demo_withdrawal.sh`（版本撤回流程）、`examples/demo_package.sh`
+（离线交付包流程）与 `examples/demo_migration.sh`（标注迁移流程）；
+先启动服务，再执行 `bash examples/demo_migration.sh`。
 
 ## 定时公开（统一 UTC 公开时间 `publish_at`）
 
@@ -419,6 +429,60 @@ manifest.json
 
 端到端示例（含成功交付校验与各类整包拒绝）：`bash examples/demo_package.sh`。
 
+## 标注迁移（同版式多目标，整批原子）
+
+档案员把一份已标注影像的遮盖方案迁移到同版式、不同尺寸的多份影像时，调用
+`POST /annotation-migrations`：请求携带**源文档 ID + 源当前标注修订号**，以及
+**1～20 个不同目标文档 ID 和各自预期修订号**（源不能作为目标）：
+
+```bash
+BASE=http://localhost:8000
+curl -sS -X POST "$BASE/annotation-migrations" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "source": {"doc_id": "SRC_ID", "expected_revision": 1},
+    "targets": [
+      {"doc_id": "T1_ID", "expected_revision": 0},
+      {"doc_id": "T2_ID", "expected_revision": 0}
+    ]
+  }'
+```
+
+- **缩放规则**：仅使用源**当前非空**标注（当前修订号下至少一个矩形），宽、高方向
+  分别按 目标/源 旋正后尺寸比例缩放；**左上边界向下取整、右下边界向上取整**并
+  限制在目标图内（源矩形非空则映射结果也非空），**原因与原顺序保留**。例如源
+  40x30 上的 `{"x":5,"y":5,"w":10,"h":10}` 迁移到 100x80 的目标得到
+  `{"x":12,"y":13,"w":26,"h":27}`。
+- **整批原子**：源及全部目标都存在、且各自预期修订号与服务端当前修订号匹配时，
+  才在同一个 `BEGIN IMMEDIATE` 写事务内**整体替换**各目标标注（目标修订号各加一，
+  与 `PUT /documents/{id}/annotations` 同样的追加式历史）；任一校验失败**所有目标
+  不变**，错误体附 `position`/`doc_id`（修订过期另附
+  `current_revision`/`supplied_revision`）标明失败项，修正后可整体重试。
+- **串行与不变性**：迁移与现有标注修改、单份/批次发布在同一写锁下互斥串行；
+  **源标注与既有发布版不受影响**（迁移只写目标的新标注修订）。
+- **成功 `201`**：按**请求顺序**返回各目标的新修订号与映射矩形：
+
+```json
+{
+  "source_doc_id": "SRC_ID",
+  "source_revision": 1,
+  "count": 2,
+  "targets": [
+    {"position": 0, "doc_id": "T1_ID", "revision": 1,
+     "rects": [{"x": 12, "y": 13, "w": 26, "h": 27, "reason": "人脸"}]},
+    {"position": 1, "doc_id": "T2_ID", "revision": 1,
+     "rects": [{"x": 2, "y": 1, "w": 6, "h": 4, "reason": "人脸"}]}
+  ]
+}
+```
+
+- **失败码**：数量不在 1～20 `400 invalid_migration_size`（附 `count`）、目标重复
+  `400 duplicate_document_in_migration`、源作为目标 `400 source_is_target`、
+  源当前标注为空 `400 empty_source_annotations`、源/目标不存在
+  `404 document_not_found`、修订号过期 `409 stale_revision`。
+
+迁移后的目标标注与手工标注完全等价：可继续 `PUT` 修改（携带新修订号）、可发布。
+端到端示例（含缩放结果、各类整批失败与重试）：`bash examples/demo_migration.sh`。
 
 ## 错误响应
 
@@ -448,6 +512,10 @@ manifest.json
 | 500 | `artifact_corrupt` | 离线交付包中成品实际 SHA-256 与发布记录不符（附 `position`/`doc_id`/`version`） |
 | 400 | `invalid_package_size` | 离线交付包条目数不在 2～20（附 `count`） |
 | 400 | `duplicate_item_in_package` | 交付包内 `(doc_id, version)` 对重复（附 `position`/`doc_id`/`version`） |
+| 400 | `invalid_migration_size` | 标注迁移目标数不在 1～20（附 `count`） |
+| 400 | `duplicate_document_in_migration` | 标注迁移内目标文档 ID 重复（附 `position`/`doc_id`） |
+| 400 | `source_is_target` | 标注迁移的源文档同时出现在目标中（附 `position`/`doc_id`） |
+| 400 | `empty_source_annotations` | 源文档当前修订号下没有任何标注矩形，无可迁移内容（附 `doc_id`） |
 | 413 | `payload_too_large` | 超过上传大小上限 |
 | 415 | `unsupported_media_type` | 非 PNG/JPEG（如 GIF） |
 
@@ -504,6 +572,15 @@ manifest.json
   才生效，本次交付完成；包内 PNG 文件名只由请求位置、服务端文档 ID 与版本号
   生成，不取自上传文件名，`manifest.json` 按请求顺序记录文档 ID、版本号、
   成品 SHA-256、遮盖数与包内文件名。
+- **标注迁移**：`POST /annotation-migrations` 先在事务外拒绝数量越界（1～20）、
+  目标重复与"源作为目标"；随后在**一个** `BEGIN IMMEDIATE` 写事务内依次校验
+  源（存在 → 修订号匹配 → 当前标注非空）与各目标（存在 → 修订号匹配，按请求
+  顺序），全部通过后才逐目标写入新标注——按各目标旋正后宽高分别缩放源矩形
+  （左上向下取整、右下向上取整并限制在图内），以"新修订号 = 当前 + 1"追加
+  `annotation_rects` 并推进 `annotation_revision`，与标注修改、单份/批次发布、
+  撤回互斥串行。任一校验失败事务整体回滚：所有目标修订号与标注不变，错误附
+  `position`/`doc_id` 定位失败项。迁移只新增目标的标注修订：源文档的标注、
+  既有发布版与版本号序列均不受影响。
 
 ## 目录结构
 
@@ -528,16 +605,42 @@ tests/test_package.py        # 13 个用例：交付包顺序/清单/摘要/遮�
                              #   不取上传名、同文档多版本、数量与重复、
                              #   未知/未到点/撤回整包拒绝不泄露、成品缺失损坏
                              #   不交付部分包、资格确认与撤回串行、临时文件清理
+tests/test_migration.py      # 18 个用例：迁移缩放取整/边界/非空、顺序与原因保留、
+                             #   修订号各加一、迁移后发布、源与发布版不变、
+                             #   数量/重复/源作为目标/缺失/修订过期/空源的整批失败、
+                             #   与标注修改、发布并发串行
 examples/demo.sh             # 单份端到端 curl 示例
 examples/demo_batch.sh       # 批次发布端到端 curl 示例
 examples/demo_idempotency.sh # 批次幂等键端到端 curl 示例
 examples/demo_scheduled_publication.sh  # 定时公开端到端 curl 示例
 examples/demo_withdrawal.sh  # 版本撤回端到端 curl 示例
 examples/demo_package.sh     # 离线交付包端到端 curl 示例
+examples/demo_migration.sh   # 标注迁移端到端 curl 示例
 Dockerfile / docker-compose.yml
 ```
 
-## 本轮变动（离线交付包 ZIP）
+## 本轮变动（标注迁移）
+
+- 新增 `POST /annotation-migrations`：请求体
+  `{"source":{"doc_id","expected_revision"},"targets":[{"doc_id","expected_revision"},…]}`
+  把源文档**当前非空标注**迁移到 **1～20 个不同目标**（源不能作为目标）；
+  成功 `201` 按请求顺序返回各目标新修订号（各加一）与映射矩形。
+- **缩放规则**：宽、高方向分别按 目标/源 旋正后尺寸比例缩放，左上边界向下
+  取整、右下边界向上取整并限制在目标图内（源矩形非空则映射结果非空），
+  原因与原顺序保留；迁移结果与手工标注等价，可继续修改、可发布。
+- **整批原子**：源及全部目标存在且修订号匹配时，才在同一个
+  `BEGIN IMMEDIATE` 写事务内整体替换各目标标注；任一校验失败所有目标不变，
+  错误附 `position`/`doc_id`（修订过期另附
+  `current_revision`/`supplied_revision`）标明失败项。新增错误码：
+  `invalid_migration_size`、`duplicate_document_in_migration`、
+  `source_is_target`、`empty_source_annotations`（均 400），源/目标缺失沿用
+  `404 document_not_found`、修订过期沿用 `409 stale_revision`。
+- **串行与不变性**：迁移与标注修改、单份/批次发布、撤回在同一写锁下互斥
+  串行；源标注与既有发布版不受影响。**不新增任何数据表或列**，既有上传、
+  标注、发布（含定时公开）、批次、幂等键、撤回、公开读取与离线交付包的
+  路由、请求/响应字段及启动方式（Docker Compose / uvicorn）全部保持兼容。
+
+## 历史变动（离线交付包 ZIP）
 
 - 新增 `POST /publication-packages`：请求体 `{"items":[{"doc_id","version"},…]}`
   按顺序携带 **2～20 个互不重复的 `(doc_id, version)` 对**；成功 `200` 返回
